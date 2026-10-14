@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Hand Figure (single-file)</title>
+    <style>
+      html,body{margin:0;height:100%;background:#05060a;color:#e8ecf5;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;overflow:hidden}
+      video,canvas{position:fixed;inset:0;width:100%;height:100%}
+      video{object-fit:cover;transform:scaleX(-1);filter:brightness(0.55) saturate(0.85)}
+      #hud{position:fixed;left:20px;bottom:16px;font-size:13px;opacity:.85;text-shadow:0 1px 6px #000}
+      #status{position:fixed;inset:0;display:grid;place-items:center;text-align:center;font-size:18px;padding:20px;pointer-events:none;text-shadow:0 1px 12px #000;transition:opacity .3s}
+      a.notice{color:#9ef;text-decoration:underline}
+    </style>
+  </head>
+  <body>
+    <video id="cam" autoplay playsinline muted></video>
+    <canvas id="skeleton"></canvas>
+    <canvas id="scene"></canvas>
+    <div id="status">Loading camera and model…</div>
+    <div id="hud"></div>
+
+    <script type="module">
+      // CDN ESM imports
+      import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js';
+      import { FilesetResolver, HandLandmarker } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14?module';
+
+      // Simple helpers
+      const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+      const smoothstep = (a,b,v)=>{const t=clamp((v-a)/(b-a),0,1); return t*t*(3-2*t);};
+
+      // Minimal OneEuro filter
+      class OneEuro {
+        constructor(minCutoff=1.5,beta=0.01,dCutoff=1){ this.minCutoff=minCutoff; this.beta=beta; this.dCutoff=dCutoff; this.x=null; this.dx=0; }
+        static alpha(cutoff,dt){ const tau=1/(2*Math.PI*cutoff); return 1/(1+tau/dt); }
+        filter(v,dt){ if(this.x===null){this.x=v;return v;} const dx=(v-this.x)/dt; this.dx += OneEuro.alpha(this.dCutoff,dt)*(dx-this.dx); const cutoff = this.minCutoff + this.beta*Math.abs(this.dx); this.x += OneEuro.alpha(cutoff,dt)*(v-this.x); return this.x; }
+      }
+
+      // --- figure renderer (simplified to avoid extra three addons) ---
+      const RING=120,PILLARS=5,HALF_H=0.7,GHOSTS=10,GHOST_STEP=0.4;
+      const COLORS=[0xc8d8ff,0x7df9ff,0x7dffb2,0xffe66d,0xffa05a,0xff6bd6].map(c=>new THREE.Color(c));
+      function perimeter(n,t,out){
+        if(n===0){ out[0]=Math.cos(t*2*Math.PI); out[1]=Math.sin(t*2*Math.PI); }
+        else if(n===1){ out[0]=0; out[1]=0; }
+        else { const u=t*n, k=Math.floor(u), f=u-k; const a0=(k/n)*2*Math.PI, a1=((k+1)/n)*2*Math.PI; out[0]=Math.cos(a0)+(Math.cos(a1)-Math.cos(a0))*f; out[1]=Math.sin(a0)+(Math.sin(a1)-Math.sin(a0))*f; }
+        return out;
+      }
+      function createFigure(scene){
+        const NV=RING+PILLARS; const cur=new Float32Array(NV*2), vel=new Float32Array(NV*2), tgt=new Float32Array(NV*2), tmp=[0,0];
+        const geometry=new THREE.BufferGeometry(); geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array((RING*2+PILLARS)*6), 3));
+        const layers=[];
+        for(let i=0;i<=GHOSTS;i++){ const mat=new THREE.LineBasicMaterial({color:0x7df9ff,transparent:true,opacity:1,depthTest:false}); const mesh=new THREE.LineSegments(geometry,mat); mesh.frustumCulled=false; mesh.renderOrder=GHOSTS-i; scene.add(mesh); layers.push(mesh); }
+        let color=COLORS[0].clone(); let sides=0;
+        function setSides(n){
+          sides=n;
+          for(let i=0;i<RING;i++){ perimeter(n,i/RING,tmp); tgt[i*2]=tmp[0]; tgt[i*2+1]=tmp[1]; }
+          for(let j=0;j<PILLARS;j++){ perimeter(n, n===0 ? j/PILLARS : (j % n)/n, tmp); tgt[(RING+j)*2]=tmp[0]; tgt[(RING+j)*2+1]=tmp[1]; }
+        }
+        setSides(0); cur.set(tgt);
+        function seg(arr,s,ax,ay,az,bx,by,bz){ const o=s*6; arr[o]=ax; arr[o+1]=ay; arr[o+2]=az; arr[o+3]=bx; arr[o+4]=by; arr[o+5]=bz; }
+        function update(dt){
+          for(let i=0;i<NV*2;i++){ vel[i]+=(240*(tgt[i]-cur[i]) - 15*vel[i])*dt; cur[i]+=vel[i]*dt; }
+          const arr = geometry.attributes.position.array;
+          for(let i=0;i<RING;i++){ const j=(i+1)%RING; seg(arr,i,cur[i*2],HALF_H,cur[i*2+1],cur[j*2],HALF_H,cur[j*2+1]); seg(arr,RING+i,cur[i*2],-HALF_H,cur[i*2+1],cur[j*2],-HALF_H,cur[j*2+1]); }
+          for(let p=0;p<PILLARS;p++){ const x=cur[(RING+p)*2], z=cur[(RING+p)*2+1]; seg(arr,RING*2+p,x,-HALF_H,z,x,HALF_H,z); }
+          geometry.attributes.position.needsUpdate=true;
+          color.lerp(COLORS[sides], 1-Math.exp(-8*dt));
+        }
+        function place(poses, visibility, motion){
+          layers.forEach((mesh,i)=>{
+            const f=Math.min(i*GHOST_STEP, poses.length-1);
+            const a0=poses[Math.floor(f)], a1=poses[Math.ceil(f)], k=f-Math.floor(f);
+            mesh.position.set(a0.x + (a1.x-a0.x)*k, a0.y + (a1.y-a0.y)*k, 0);
+            mesh.quaternion.slerpQuaternions(a0.q, a1.q, k);
+            mesh.scale.setScalar(a0.r + (a1.r-a0.r)*k);
+            const a = i===0 ? visibility : visibility * motion * 0.55 * (1 - i/(GHOSTS+1));
+            mesh.visible = a > 0.01;
+            mesh.material.color.copy(color).multiplyScalar(a);
+            mesh.material.opacity = a;
+          });
+        }
+        function resize(w,h){ layers.forEach(m=>{}); }
+        return { setSides, update, place, resize, color, ghosts:GHOSTS };
+      }
+
+      // --- hand utils (same logic as original) ---
+      const PALM=[0,5,9,13,17], TIPS=[4,8,12,16,20], FINGERS=[[5,6,8],[9,10,12],[13,14,16],[17,18,20]];
+      const LEAD_GRACE_MS=500, TOOL_GRACE_MS=300, OPEN_MIN=0.65, OPEN_MAX=0.95, PINCH_MIN=0.25, PINCH_MAX=0.9;
+      const dist3=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y,a.z-b.z), dist2=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y), wrapAngle=a=>Math.atan2(Math.sin(a),Math.cos(a));
+      function countFingers(w){ let n=0; for(const [mcp,pip,tip] of FINGERS){ if(dist3(w[tip],w[0])>dist3(w[pip],w[0])*1.12 && dist3(w[tip],w[mcp])>dist3(w[pip],w[mcp])*1.25) n++; } if(dist3(w[4],w[17])>dist3(w[5],w[17])*1.4) n++; return n; }
+      function openness(w){
+        const c={x:0,y:0,z:0}; for(const i of PALM){ c.x+=w[i].x/PALM.length; c.y+=w[i].y/PALM.length; c.z+=w[i].z/PALM.length; }
+        let sum=0; for(const i of TIPS) sum+=dist3(w[i],c);
+        const palm=dist3(w[0],w[9]);
+        const open = clamp((sum/TIPS.length/palm - OPEN_MIN)/(OPEN_MAX-OPEN_MIN),0,1);
+        const pinch = clamp((dist3(w[4],w[8])/palm - PINCH_MIN)/(PINCH_MAX-PINCH_MIN),0,1);
+        return Math.min(open,pinch);
+      }
+
+      // --- start tracking (tries to load model; falls back to demo) ---
+      async function startTracking(video, view){
+        // Use cpu delegate for maximum compatibility
+        const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
+        const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+        const fileset = await FilesetResolver.forVisionTasks(WASM_URL);
+        const landmarker = await HandLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: MODEL_URL, delegate: 'CPU' },
+          runningMode: 'VIDEO',
+          numHands: 2,
+          minHandDetectionConfidence: 0.6,
+          minHandPresenceConfidence: 0.6,
+          minTrackingConfidence: 0.6,
+        });
+
+        let lead=null, tool=null;
+        function toPx(lm){
+          const s = Math.max(view.W / video.videoWidth, view.H / video.videoHeight);
+          const dw = video.videoWidth * s, dh = video.videoHeight * s;
+          return { x: (view.W - dw)/2 + (1 - lm.x)*dw, y: (view.H - dh)/2 + lm.y*dh };
+        }
+        function measure(lm, world){
+          const pts = lm.map(toPx);
+          let x=0,y=0; for(const i of PALM){ x+=pts[i].x/PALM.length; y+=pts[i].y/PALM.length; }
+          return { pts, x, y, size: Math.max(dist2(pts[0],pts[9]), dist2(pts[5],pts[17])*1.3), fingers: countFingers(world), open: openness(world), angle: Math.atan2(pts[9].y-pts[0].y, pts[9].x-pts[0].x) };
+        }
+
+        function gap(tr,d){ return Math.hypot(d.x-tr.rawX, d.y-tr.rawY); }
+        function near(tr,d){ return gap(tr,d) < Math.max(view.W*0.25, tr.size*3); }
+
+        class Track {
+          constructor(d,now){
+            this.t=now; this.seen=now;
+            this.fx=new OneEuro(1.5,0.012); this.fy=new OneEuro(1.5,0.012); this.fs=new OneEuro(0.8,0.003); this.fo=new OneEuro(2.5,2.0);
+            this.ftx=new OneEuro(2.5,0.02); this.fty=new OneEuro(2.5,0.02);
+            this.hist=[]; this.fingers=d.fingers; this.vx=this.vy=this.twist=this.openRate=0; this.tipX=this.tipY=this.angle=null;
+            this.update(d,now);
+          }
+          update(d,now){
+            const dt=Math.max(1/120,(now-this.t)/1000); this.t=this.seen=now;
+            this.rawX=d.x; this.rawY=d.y; this.pts=d.pts; this.x=this.fx.filter(d.x,dt); this.y=this.fy.filter(d.y,dt); this.size=this.fs.filter(d.size,dt);
+            this.hist.push(d.fingers); if(this.hist.length>3) this.hist.shift(); if(this.hist.length===3 && this.hist.every(v=>v===d.fingers)) this.fingers=d.fingers;
+            const open=this.fo.filter(d.open,dt); if(this.open!==undefined) this.openRate += 0.5*((open-this.open)/dt - this.openRate); this.open=open;
+            const tx=this.ftx.filter(d.pts[8].x,dt); const ty=this.fty.filter(d.pts[8].y,dt);
+            if(this.tipX!==null){ this.vx += 0.6*((tx-this.tipX)/dt - this.vx); this.vy += 0.6*((ty-this.tipY)/dt - this.vy); this.twist += 0.5*(wrapAngle(d.angle - this.angle)/dt - this.twist); }
+            this.tipX=tx; this.tipY=ty; this.angle=d.angle;
+          }
+        }
+
+        function process(result, now){
+          const dets = result.landmarks.map((lm,i)=>measure(lm, result.worldLandmarks[i]));
+          if(lead && tool && dets.length===2){
+            const [a,b]=dets; const straight = gap(lead,a)+gap(tool,b) <= gap(lead,b)+gap(tool,a);
+            lead.update(straight?a:b, now); tool.update(straight?b:a, now); dets.length=0;
+          } else {
+            for(const tr of [lead,tool]){ if(!tr || !dets.length) continue; let best=0; for(let i=1;i<dets.length;i++) if(gap(tr,dets[i])<gap(tr,dets[best])) best=i; if(near(tr,dets[best])) tr.update(dets.splice(best,1)[0], now); }
+          }
+          for(const d of dets){ if(!lead) lead=new Track(d,now); else if(!tool) tool=new Track(d,now); }
+        }
+
+        function expire(now){ if(tool && now-tool.seen > TOOL_GRACE_MS) tool=null; if(lead && now-lead.seen > LEAD_GRACE_MS){ lead = tool; tool = null; } }
+
+        const onFrame = () => {
+          const now = performance.now();
+          if(video.videoWidth) process(landmarker.detectForVideo(video, now), now);
+          video.requestVideoFrameCallback(onFrame);
+        };
+        video.requestVideoFrameCallback(onFrame);
+
+        return {
+          read(now){ expire(now); return { lead: lead && {x:lead.x,y:lead.y,size:lead.size,fingers:lead.fingers}, tool: tool && { open:tool.open, openRate:tool.openRate, vx:tool.vx, vy:tool.vy, twist:tool.twist, fresh: now - tool.seen < 120 }, hands: [lead,tool].filter(Boolean).map(tr=>tr.pts) }; }
+        };
+      }
+
+      // --- demo input (runs without model) ---
+      function demoInput(t, view){
+        const fast = Math.sin(t*0.5) > 0.3 ? 2 : 0.6;
+        return {
+          lead: { x: view.W/2 + Math.sin(t*1.1*fast)*view.W*0.25, y: view.H*0.7 + Math.cos(t*0.8)*view.H*0.08, size: 110, fingers: Math.floor(t/2)%6 },
+          tool: t%12 > 6 && { open: 0.5+0.5*Math.sin(t*1.5), openRate: 0.75*Math.cos(t*1.5), vx: 700*Math.sin(t*2), vy:0, twist:0, fresh:true },
+          hands: []
+        };
+      }
+
+      // --- main app ---
+      const video = document.getElementById('cam');
+      const sceneCanvas = document.getElementById('scene');
+      const skeleton = document.getElementById('skeleton');
+      const statusEl = document.getElementById('status');
+      const hud = document.getElementById('hud');
+      const sk = skeleton.getContext('2d');
+
+      const view = { W: innerWidth, H: innerHeight };
+      const renderer = new THREE.WebGLRenderer({ canvas: sceneCanvas, alpha: true, antialias: true });
+      renderer.setClearColor(0x000000,0);
+      const scene = new THREE.Scene();
+      const camera = new THREE.PerspectiveCamera(35,1,1,10000);
+      const figure = createFigure(scene);
+
+      function resize(){ view.W = innerWidth; view.H = innerHeight; const dpr=Math.min(devicePixelRatio,2); renderer.setPixelRatio(dpr); renderer.setSize(view.W, view.H, false); skeleton.width=view.W*dpr; skeleton.height=view.H*dpr; sk.setTransform(dpr,0,0,dpr,0,0); camera.aspect=view.W/view.H; camera.position.set(view.W/2, -view.H/2, view.H/2/Math.tan(THREE.MathUtils.degToRad(camera.fov/2))); camera.updateProjectionMatrix(); figure.resize(view.W,view.H); }
+      addEventListener('resize', resize); resize();
+
+      // simulation state (same as original)
+      const CFG = { hover:2.3, radius:0.8, followK:180, followC:16, gravity:1400, scaleMin:0.35, scaleMax:3.2, idleSpin:0.9, spinFriction:0.7, spinGain:0.84, maxBlur:6 };
+      const pos={x:view.W/2,y:view.H/2}, vel={x:0,y:0}; let radius=90, scale=1, scaleV=0, scaleTarget=1, pop=1, popV=0, visibility=0, pulse=0, blur=0, sides=-1, spinY=0;
+      const omega=new THREE.Vector3(), qUser=new THREE.Quaternion(), qTilt=new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0),0.5), qSpin=new THREE.Quaternion(), qBank=new THREE.Quaternion(), dq=new THREE.Quaternion(), axis=new THREE.Vector3(), euler=new THREE.Euler(), Y=new THREE.Vector3(0,1,0);
+      const poses=[];
+
+      function step(input, dt, t){
+        const { lead, tool } = input;
+        if(lead){
+          radius += (lead.size * CFG.radius - radius) * (1 - Math.exp(-10*dt));
+          const tx = lead.x + Math.cos(t*1.7) * lead.size * 0.12;
+          const ty = lead.y - lead.size * CFG.hover + Math.sin(t*2.3) * lead.size * 0.08;
+          if(visibility < 0.05){ pos.x=tx; pos.y=ty; vel.x=vel.y=0; pop=0.3; }
+          vel.x += (CFG.followK*(tx-pos.x) - CFG.followC*vel.x)*dt;
+          vel.y += (CFG.followK*(ty-pos.y) - CFG.followC*vel.y)*dt;
+          visibility += (1-visibility)*(1-Math.exp(-8*dt));
+          if(lead.fingers !== sides){
+            const first = sides < 0; sides = lead.fingers; figure.setSides(sides);
+            if(!first){ pulse=1; popV+=5; omega.y += 5; }
+          }
+        } else {
+          vel.y += CFG.gravity * dt;
+          visibility *= Math.exp(-4*dt);
+        }
+        pos.x += vel.x * dt; pos.y += vel.y * dt;
+        if(tool?.fresh){
+          scaleTarget = CFG.scaleMin + (CFG.scaleMax - CFG.scaleMin) * tool.open;
+          const steady = 1 - smoothstep(1,2.5,Math.abs(tool.openRate));
+          const r = Math.max(40, radius*scale);
+          const wSwipe = smoothstep(150,900,Math.hypot(tool.vx,tool.vy)) * steady;
+          const kSwipe = 1 - Math.exp(-14 * wSwipe * dt);
+          omega.x += ((tool.vy / r) * CFG.spinGain - omega.x) * kSwipe;
+          omega.y += ((tool.vx / r) * CFG.spinGain - omega.y) * kSwipe;
+          const kTwist = 1 - Math.exp(-14 * smoothstep(1,5,Math.abs(tool.twist)) * steady * dt);
+          omega.z += (-tool.twist * CFG.spinGain - omega.z) * kTwist;
+        }
+        scaleV += (320 * (scaleTarget - scale) - 20 * scaleV) * dt; scale += scaleV * dt;
+        popV += (260 * (1 - pop) - 14 * popV) * dt; pop += popV * dt;
+        omega.clampLength(0,21).multiplyScalar(Math.exp(-CFG.spinFriction * dt));
+        const angle = omega.length() * dt; if(angle > 1e-6) qUser.premultiply(dq.setFromAxisAngle(axis.copy(omega).normalize(), angle)).normalize();
+        spinY += CFG.idleSpin * dt; qSpin.setFromAxisAngle(Y, spinY);
+        qBank.setFromEuler(euler.set(clamp(vel.y*0.00045,-0.5,0.5),0,clamp(vel.x*0.00045,-0.5,0.5)));
+        figure.update(dt);
+        pulse *= Math.exp(-5*dt);
+      }
+
+      function present(dt){
+        const speed = Math.hypot(vel.x,vel.y); const spin = omega.length();
+        const pose = poses.length > figure.ghosts ? poses.pop() : { q: new THREE.Quaternion() };
+        pose.x = pos.x; pose.y = -pos.y; pose.r = Math.max(1, radius*scale*pop);
+        pose.q.copy(qBank).multiply(qUser).multiply(qTilt).multiply(qSpin);
+        poses.unshift(pose);
+        figure.place(poses, visibility, clamp(speed/700 + spin/8 + pulse, 0, 1));
+        const blurTarget = clamp(speed/450 + spin*0.35 + Math.abs(scaleV)*0.5 + pulse*4, 0, CFG.maxBlur);
+        blur += (blurTarget - blur) * (1 - Math.exp(-18*dt));
+        sceneCanvas.style.filter = blur > 0.25 ? `blur(${blur.toFixed(2)}px) drop-shadow(0 0 12px #${figure.color.getHexString()})` : `drop-shadow(0 0 12px #${figure.color.getHexString()})`;
+      }
+
+      const BONES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+      function drawHands(hands){ sk.clearRect(0,0,view.W,view.H); hands.forEach((pts,i)=>{ sk.strokeStyle = sk.fillStyle = i===0 ? 'rgba(125,249,255,0.45)' : 'rgba(255,107,214,0.45)'; sk.lineWidth=1; sk.beginPath(); for(const [a,b] of BONES){ sk.moveTo(pts[a].x,pts[a].y); sk.lineTo(pts[b].x,pts[b].y); } sk.stroke(); for(const p of pts){ sk.beginPath(); sk.arc(p.x,p.y,2,0,Math.PI*2); sk.fill(); } }); }
+
+      // try to open camera and model; if model fails, fallback to demo-only
+      async function openCamera(){ const stream = await navigator.mediaDevices.getUserMedia({ audio:false, video:{ facingMode:'user', width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:60} } }); video.srcObject = stream; await video.play(); }
+
+      // bootstrap
+      (async ()=>{
+        let trackerRead = null;
+        // First attempt: open camera
+        try {
+          await openCamera();
+        } catch(err){
+          statusEl.textContent = "Camera not available or permission denied. Open with ?demo to see animation without camera.";
+          console.error('Camera open failed', err);
+        }
+
+        // Attempt to load model and start tracking; if it fails, fallback to demo mode
+        try {
+          const tracker = await startTracking(video, view);
+          trackerRead = tracker.read;
+          statusEl.textContent = 'Point your hand at the camera';
+        } catch(err){
+          console.warn('Model or wasm failed to load — falling back to demo', err);
+          statusEl.textContent = 'Model failed to load — demo running. See console for details.';
+        }
+
+        // If no tracker, use demoInput
+        if(!trackerRead) trackerRead = (now)=>demoInput(now/1000, view);
+
+        let last = performance.now();
+        let fps = 60;
+        let frame = 0;
+
+        function loop(now){
+          requestAnimationFrame(loop);
+          const rawDt = (now - last)/1000; last = now;
+          const input = trackerRead(now);
+          const dt = Math.min(rawDt, 0.05);
+          const n = Math.max(1, Math.ceil(dt/(1/120)));
+          for(let i=0;i<n;i++) step(input, dt/n, now/1000 - dt + ((i+1)*dt)/n);
+          present(dt);
+          renderer.render(scene, camera);
+          drawHands(input.hands);
+          fps += (1/Math.max(rawDt,1e-3) - fps)*0.05;
+          if(frame++ % 10 === 0){
+            statusEl.style.opacity = input.lead ? 0 : 1;
+            statusEl.textContent = input.lead ? 'Point your hand at the camera' : 'No hand detected — show your hand';
+            hud.textContent = input.lead ? `lead: ${input.lead.fingers} · ${fps.toFixed(0)} fps` : `${fps.toFixed(0)} fps`;
+          }
+        }
+        requestAnimationFrame(loop);
+      })().catch(err=>{ console.error(err); statusEl.style.opacity=1; statusEl.textContent = `Startup failed: ${err.message}`; });
+    </script>
+  </body>
+</html>
